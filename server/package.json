@@ -1,0 +1,15 @@
+{
+  "name": "mk-cam-signaling",
+  "version": "0.1.0",
+  "description": "MK Cam signaling server (PIN pairing + WebRTC signal relay)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,8 +1,7 @@
 name: Build APKs
 
 on:
-  push:
-    branches: [main]
+  # Manual only: run it from the Actions tab when you want fresh APKs.
   workflow_dispatch:
 
 jobs:

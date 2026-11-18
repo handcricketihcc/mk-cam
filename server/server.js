@@ -2,16 +2,16 @@
 // Job: PIN pairing + relaying WebRTC offer/answer/ICE between Device and Viewer.
 // Media never passes through here (it goes peer-to-peer, or via TURN).
 const http = require("http");
-const fs = require("fs");
-const path = require("path");
 const crypto = require("crypto");
 const { Server } = require("socket.io");
 
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "pairs.json");
 const PIN_TTL_MS = 10 * 60 * 1000;
 
-// ICE servers handed to the apps. Add your TURN via env TURN_URL / TURN_USER / TURN_PASS.
+// ICE servers handed to the apps.
+// - Google STUN always.
+// - Your own TURN via env TURN_URL / TURN_USER / TURN_PASS.
+// - Free public test TURN (Open Relay) unless FREE_TURN=off. Fine for testing; may be unreliable.
 function iceServers() {
   const list = [{ urls: "stun:stun.l.google.com:19302" }];
   if (process.env.TURN_URL) {
@@ -20,26 +20,38 @@ function iceServers() {
       username: process.env.TURN_USER || "",
       credential: process.env.TURN_PASS || "",
     });
+  } else if (process.env.FREE_TURN !== "off") {
+    list.push({
+      urls: [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp",
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    });
   }
   return list;
 }
 
-// ---- persistence: pairs survive server restarts ----
-// pairs[pairId] = { secretHash: {viewer, device} }
-let pairs = {};
-try {
-  pairs = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-} catch (_) {
-  pairs = {};
+// ---- stateless pairing: no database needed ----
+// A pairing secret = HMAC(SERVER_KEY, pairId|role). The server just recomputes it to verify,
+// so free hosts that wipe the disk on restart do not lose pairings.
+// Changing SERVER_KEY invalidates every pairing.
+let SERVER_KEY = process.env.SERVER_KEY;
+if (!SERVER_KEY) {
+  SERVER_KEY = crypto.randomBytes(32).toString("hex");
+  console.warn("WARNING: SERVER_KEY not set. Pairings will break on every restart. Set SERVER_KEY.");
 }
-function save() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(pairs));
-  } catch (e) {
-    console.error("save failed", e.message);
-  }
+const sign = (pairId, role) =>
+  crypto.createHmac("sha256", SERVER_KEY).update(pairId + "|" + role).digest("hex");
+function validSecret(pairId, role, secret) {
+  if (typeof pairId !== "string" || typeof secret !== "string") return false;
+  if (role !== "viewer" && role !== "device") return false;
+  const a = Buffer.from(sign(pairId, role));
+  const b = Buffer.from(secret);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
-const sha = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const rand = (n) => crypto.randomBytes(n).toString("hex");
 
 // pending PINs: pin -> { pairId, viewerSecret, expires }
@@ -88,7 +100,7 @@ io.on("connection", (socket) => {
       pin = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
     } while (pending.has(pin));
     const pairId = rand(8);
-    const viewerSecret = rand(24);
+    const viewerSecret = sign(pairId, "viewer");
     pending.set(pin, { pairId, viewerSecret, expires: Date.now() + PIN_TTL_MS, socketId: socket.id });
     ack(cb, { ok: true, pin, pairId, secret: viewerSecret, iceServers: iceServers() });
   });
@@ -100,9 +112,7 @@ io.on("connection", (socket) => {
     const p = pending.get(pin);
     if (!p || p.expires < Date.now()) return ack(cb, { ok: false, error: "bad_pin" });
     pending.delete(pin); // one-time
-    const deviceSecret = rand(24);
-    pairs[p.pairId] = { viewer: sha(p.viewerSecret), device: sha(deviceSecret) };
-    save();
+    const deviceSecret = sign(p.pairId, "device");
     ack(cb, { ok: true, pairId: p.pairId, secret: deviceSecret, iceServers: iceServers() });
     io.to(p.socketId).emit("pair:claimed", { pairId: p.pairId });
   });
@@ -111,8 +121,7 @@ io.on("connection", (socket) => {
   socket.on("join", (d, cb) => {
     if (limited(ip, "join", 30, 60000)) return ack(cb, { ok: false, error: "rate_limited" });
     const { pairId, role, secret } = d || {};
-    const pair = pairs[pairId];
-    if (!pair || (role !== "viewer" && role !== "device") || sha(secret) !== pair[role]) {
+    if (!validSecret(pairId, role, secret)) {
       return ack(cb, { ok: false, error: "unauthorized" });
     }
     const room = online.get(pairId) || {};
